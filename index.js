@@ -1,42 +1,42 @@
 const express = require('express');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-
 const app = express();
-app.use(express.urlencoded({ extended: true }));
+
+// تمكين قراءة البيانات القادمة بصيغة JSON أو URL-Encoded من روبلوكس
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// أدخل مفتاح Gemini API الخاص بك هنا
-const genAI = new GoogleGenerativeAI('AQ.Ab8RN6LyDk6FsyWOYbD6Y0MDEq5h-86AWVPdzAkWsanlHDh9nw');
-const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-
-// نص مؤقت لتخزينه وعرضه على القطعة
-let currentOutput = "HELLO"; 
-
-// تحويل الحروف إلى ASCII Decimal ثم إلى Binary (8-bit) ليفهمها الهاردوير
-function textTo8BitBinary(text) {
-    if (!text || text.length === 0) return "00000000";
-    const charCode = text.charCodeAt(0); // يأخذ أول حرف
-    return charCode.toString(2).padStart(8, '0');
-}
-
-// الـ Endpoint الذي ستطلبه قطعة الـ HTTP في الماب
-app.all('/api/display', async (req, res) => {
-    // إذا أرسلت القطعة سؤالاً جديداً عبر الـ Query أو Body
-    const prompt = req.query.prompt || req.body.prompt;
-
-    if (prompt) {
-        try {
-            const result = await model.generateContent(prompt);
-            currentOutput = result.response.text().trim();
-        } catch (error) {
-            console.error("Error:", error);
-        }
-    }
-
-    // إرجاع النتيجة بالصيغة المطلوب إرسالها للقطعة {"value":"00000000"}
-    const binaryValue = textTo8BitBinary(currentOutput);
-    res.json({ value: binaryValue });
+// 1. الصفحة الرئيسية (تأكيد عمل السيرفر)
+app.get('/', (req, res) => {
+    res.status(200).send(`
+        <!DOCTYPE html>
+        <html>
+        <head><title>Build Logic AI Server</title></head>
+        <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
+            <h1>🚀 Roblox Build Logic AI Server is Running!</h1>
+            <p>API Endpoint: <code>/api/display</code></p>
+        </body>
+        </html>
+    `);
 });
 
+// 2. مسار التعامل مع قطعة HTTP في الماب (GET & POST)
+app.all('/api/display', async (req, res) => {
+    try {
+        // استخراج القيمة سواء كانت قادمة من POST body أو GET query
+        const rawValue = req.body?.value || req.query?.value || "00000000";
+
+        console.log("البيانات المستلمة من الماب:", rawValue);
+
+        // إرجاع الاستجابة بتنسيق JSON المناسب لقطعة الـ HTTP
+        res.status(200).json({ value: rawValue });
+    } catch (error) {
+        console.error("حدث خطأ في السيرفر:", error);
+        res.status(500).json({ error: "Internal Server Error", message: error.message });
+    }
+});
+
+// تشغيل السيرفر على المنفذ المحدد من Render
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+});
