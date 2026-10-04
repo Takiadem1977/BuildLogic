@@ -119,7 +119,8 @@ app.get('/api/ask', async (req, res) => {
 
     try {
         const genAI = new GoogleGenerativeAI(apiKey);
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        // تحديث اسم النموذج إلى gemini-2.5-flash
+        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
         
         console.log(`[Gemini Request] إرسال النص: "${session.buffer}"`);
         const result = await model.generateContent(session.buffer);
