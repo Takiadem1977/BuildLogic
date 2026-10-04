@@ -8,9 +8,9 @@ app.use(express.urlencoded({ extended: true }));
 
 const apiKey = process.env.GEMINI_API_KEY;
 
-// تخزين المحادثات والجلسات في الذاكرة
+// تخزين المحادثات وقوائم إرسال الأحرف للشاشة
 const sessions = {
-    "default": { buffer: "", lastResponse: "" }
+    "default": { buffer: "", lastResponse: "", outputQueue: [] }
 };
 
 // 1. واجهة التتبع المباشرة
@@ -49,8 +49,9 @@ app.get('/', (req, res) => {
                 <button onclick="clearBuffer()" class="btn-clear">تفريغ النص (Clear)</button>
                 <button onclick="askGemini()" class="btn-ask">🤖 إرسال النص إلى Gemini</button>
                 <hr style="border-color: #334155; margin-top: 20px;" />
-                <p>رد Gemini الأخير:</p>
+                <p>رد Gemini الأخير (جاري الإرسال للشاشة):</p>
                 <div class="code-box" id="aiResponseText" style="color: #4ade80;">-</div>
+                <p>الحروف المتبقية للطباعة: <b id="remainingChars">0</b></p>
             </div>
 
             <script>
@@ -68,6 +69,7 @@ app.get('/', (req, res) => {
                         const data = await res.json();
                         document.getElementById('bufferText').innerText = data.buffer || '(فارغ)';
                         document.getElementById('aiResponseText').innerText = data.lastResponse || '(لا يوجد رد بعد)';
+                        document.getElementById('remainingChars').innerText = data.remaining || '0';
                     } catch(e){}
                 }
 
@@ -91,20 +93,21 @@ app.get('/', (req, res) => {
     `);
 });
 
-// 2. مسارات التحكم بالجلسة
+// 2. مسارات إدارة الجلسة
 app.get('/api/session', (req, res) => {
     const sid = req.query.sid || 'default';
-    res.json(sessions[sid] || { buffer: "", lastResponse: "" });
+    const s = sessions[sid] || { buffer: "", lastResponse: "", outputQueue: [] };
+    res.json({ buffer: s.buffer, lastResponse: s.lastResponse, remaining: s.outputQueue.length });
 });
 
 app.get('/api/clear', (req, res) => {
     const sid = req.query.sid || 'default';
-    if (!sessions[sid]) sessions[sid] = { buffer: "", lastResponse: "" };
+    if (!sessions[sid]) sessions[sid] = { buffer: "", lastResponse: "", outputQueue: [] };
     sessions[sid].buffer = "";
     res.json({ success: true });
 });
 
-// 3. مسار إرسال الـ Buffer المجمع إلى Gemini
+// 3. مسار طلب إجابة Gemini وتجهيز قائمة الإرسال (Queue)
 app.get('/api/ask', async (req, res) => {
     const sid = req.query.sid || 'default';
     const session = sessions[sid];
@@ -119,14 +122,20 @@ app.get('/api/ask', async (req, res) => {
 
     try {
         const genAI = new GoogleGenerativeAI(apiKey);
-        // تحديث اسم النموذج إلى gemini-2.5-flash
         const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
         
-        console.log(`[Gemini Request] إرسال النص: "${session.buffer}"`);
-        const result = await model.generateContent(session.buffer);
-        const reply = result.response.text();
+        // إرسال تعليمات لإرجاع إجابة قصيرة ومباشرة بدون رموز خاصة
+        const prompt = `Answer in short uppercase English text (max 30 letters) without special characters: ${session.buffer}`;
+        const result = await model.generateContent(prompt);
+        const reply = result.response.text().trim().toUpperCase();
 
         session.lastResponse = reply;
+        
+        // تحويل رد الذكاء الاصطناعي إلى قائمة حروف (Queue)
+        session.outputQueue = reply.split('');
+        
+        console.log(`[Gemini Reply] "${reply}" | تم إدخال ${session.outputQueue.length} حرف إلى قائمة الانتظار.`);
+
         res.json({ response: reply });
     } catch (err) {
         console.error("Gemini Error:", err);
@@ -134,20 +143,19 @@ app.get('/api/ask', async (req, res) => {
     }
 });
 
-// 4. مسار استقبال النبضات من الماب (POST / GET)
+// 4. مسار استقبال النبضات وإرسال الأحرف المتبقية للشاشة
 app.all('/api/display', (req, res) => {
     const sid = req.query.sid || req.body?.sid || "default";
 
     if (!sessions[sid]) {
-        sessions[sid] = { buffer: "", lastResponse: "" };
+        sessions[sid] = { buffer: "", lastResponse: "", outputQueue: [] };
     }
 
+    const session = sessions[sid];
+
+    // أ) معالجة الحرف المكتوب من الماب (إن وجد)
     let rawValue = req.body?.value || req.query?.value || req.body?.data || "00000000";
-    console.log(`[SID: ${sid}] البيانات الخام المستلمة:`, rawValue);
-
     let char = "";
-
-    // تحليل البايت واستخراج الحرف
     if (typeof rawValue === 'string' && /^[01]{8}$/.test(rawValue)) {
         const code = parseInt(rawValue, 2);
         if (code > 0) char = String.fromCharCode(code);
@@ -156,17 +164,24 @@ app.all('/api/display', (req, res) => {
     }
 
     if (char && char !== "\0") {
-        sessions[sid].buffer += char;
-        console.log(`[SID: ${sid}] ✅ تم تسجيل الحرف: "${char}" | الـ Buffer الحالي: "${sessions[sid].buffer}"`);
+        session.buffer += char;
     }
 
-    // إرجاع الرد للماب
+    // ب) إخراج الحرف التالي من قائمة الرد (Queue) للشاشة
+    let sendBinary = "00000000";
+    if (session.outputQueue && session.outputQueue.length > 0) {
+        const nextChar = session.outputQueue.shift(); // أخذ الحرف الأول
+        const charCode = nextChar.charCodeAt(0);
+        sendBinary = charCode.toString(2).padStart(8, '0');
+        console.log(`[SID: ${sid}] إرسال الحرف "${nextChar}" (Binary: ${sendBinary}) للشاشة.`);
+    }
+
+    // إرجاع البايت في الـ JSON
     res.status(200).json({ 
-        value: rawValue,
+        value: sendBinary,
         sid: sid,
-        receivedChar: char,
-        buffer: sessions[sid].buffer,
-        lastResponse: sessions[sid].lastResponse
+        buffer: session.buffer,
+        remaining: session.outputQueue.length
     });
 });
 
