@@ -10,24 +10,48 @@ const apiKey = process.env.GEMINI_API_KEY;
 
 const session = { buffer: "", lastResponse: "", outputQueue: [] };
 
-// حساب الرقم المباشر للمنافذ (1, 2, 4, 8, 16, 32)
-function getCharacterValue(char) {
+// دالة تحويل الحرف إلى البتات الـ 6 الخاصة بشاشة Build Logic
+function getCharacterBits(char) {
     let code = char.charCodeAt(0);
     let shift = 0;
 
+    // الحروف الكبيرة تفعل منفذ SHIFT
     if (char >= 'A' && char <= 'Z') {
         shift = 1;
         code = char.toLowerCase().charCodeAt(0);
     }
 
-    let val = 0;
-    if (code >= 97 && code <= 122) { // a-z -> 1-26
-        val = code - 96;
+    let bitVal = 0;
+    if (code >= 97 && code <= 122) { // a-z
+        bitVal = code - 96; // a=1, b=2, c=3, d=4 ...
     } else if (code >= 48 && code <= 57) { // 0-9
-        val = code - 48 + 27;
+        bitVal = code - 48 + 27;
+    } else if (char === ' ') {
+        bitVal = 0;
     }
 
-    return { value: val, shift: shift };
+    // تحويل القيمة الرقمية إلى 6 بتات مرتبة من Bit0 إلى Bit5
+    // Bit0 (أقصى اليمين) = a (1)
+    // Bit1 = b (2)
+    // Bit2 = d (4)
+    // Bit3 = h (8)
+    // Bit4 = p (16)
+    // Bit5 (أقصى اليسار) = 32
+    let b0 = (bitVal & 1) ? "1" : "0";
+    let b1 = (bitVal & 2) ? "1" : "0";
+    let b2 = (bitVal & 4) ? "1" : "0";
+    let b3 = (bitVal & 8) ? "1" : "0";
+    let b4 = (bitVal & 16) ? "1" : "0";
+    let b5 = (bitVal & 32) ? "1" : "0";
+
+    // السلسلة الثنائية المرتبة
+    const binary6 = b5 + b4 + b3 + b2 + b1 + b0;
+
+    return {
+        bits: binary6,
+        shift: shift,
+        val: bitVal
+    };
 }
 
 app.get('/', (req, res) => {
@@ -36,7 +60,7 @@ app.get('/', (req, res) => {
         <html lang="ar">
         <head>
             <meta charset="UTF-8">
-            <title>Build Logic Simple Monitor</title>
+            <title>Build Logic Text Fixer</title>
             <style>
                 body { font-family: system-ui, sans-serif; text-align: center; background: #0f172a; color: #f8fafc; padding: 30px; }
                 button { padding: 12px 20px; font-size: 16px; border-radius: 6px; border: none; background: #059669; color: white; cursor: pointer; font-weight: bold; }
@@ -45,7 +69,7 @@ app.get('/', (req, res) => {
             </style>
         </head>
         <body>
-            <h1>🚀 Build Logic Simple Monitor</h1>
+            <h1>🚀 Build Logic Text Fixer</h1>
             <div class="card">
                 <p>النص المرسل من الماب:</p>
                 <div class="code-box" id="bufferText">-</div>
@@ -95,7 +119,7 @@ app.get('/api/ask', async (req, res) => {
         const genAI = new GoogleGenerativeAI(apiKey);
         const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
         
-        const prompt = `Answer in short English text (max 12 letters, no symbols): ${session.buffer}`;
+        const prompt = `Answer in short English text (max 10 letters, no symbols): ${session.buffer}`;
         const result = await model.generateContent(prompt);
         const reply = result.response.text().trim().replace(/[^a-zA-Z0-9 ]/g, '');
 
@@ -120,19 +144,19 @@ app.all('/api/display', (req, res) => {
         session.buffer += char;
     }
 
-    let charVal = 0;
+    let sendBits = "000000";
     let shiftVal = 0;
 
     if (session.outputQueue && session.outputQueue.length > 0) {
         const nextChar = session.outputQueue.shift();
-        const data = getCharacterValue(nextChar);
-        charVal = data.value;
+        const data = getCharacterBits(nextChar);
+        sendBits = data.bits;
         shiftVal = data.shift;
+        console.log(`[Char: '${nextChar}'] -> Value: ${data.val} | Bits sent: ${sendBits}`);
     }
 
-    // إرجاع قيمة رقمية صريحة
     res.status(200).json({ 
-        value: charVal,
+        value: sendBits,
         shift: shiftVal,
         remaining: session.outputQueue.length
     });
