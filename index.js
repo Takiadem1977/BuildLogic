@@ -82,9 +82,12 @@ app.post('/api/display', (req, res) => {
 });
 
 // GET: القطعة تسأل كل 0.1 ثانية، نعطيها حرفاً واحداً في كل مرة
+let gap = false; // فراغ بين كل حرفين حتى ينزل البت 7 ويطلع من جديد
 app.get('/api/display', (req, res) => {
+    if (gap) { gap = false; return res.json({ value: '00000000' }); }
     const ch = session.queue.shift();
     if (ch === undefined) return res.json({ value: '00000000' });
+    gap = true;
     const bits = toBits8(encodeChar(ch));
     log(`[PRINT] '${ch}' -> ${bits} | باقي ${session.queue.length}`);
     res.json({ value: bits });
