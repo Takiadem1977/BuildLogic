@@ -30,15 +30,27 @@ function fromBits8(str) {
 // ---------- ترميز الحرف للشاشة ----------
 // الإطار (8 بتات):  bit7 = valid (يسمح بالـ Clock)
 //                    bit6 = SHIFT
-//                    bit5..0 = الحرف (a=1 ... z=26, 0-9 = 27..36, مسافة = 0)
+//                    bit5..0 = رقم الحرف (0..63)
+// الجدولان أدناه: رقم الحرف = موضعه في النص (الفهرس).
+// عدّلهما بعد ما تشغّل /api/scan وتشوف ترتيب الحروف الفعلي على الشاشة.
+// استعمل \u0002 لأي خانة لا تعرف ما هو الحرف فيها.
+const PAD = '\u0002';
+const TABLE0 = (' abcdefghijklmnopqrstuvwxyz1234567890').padEnd(64, PAD); // SHIFT = 0
+const TABLE1 = (' ABCDEFGHIJKLMNOPQRSTUVWXYZ').padEnd(64, PAD);           // SHIFT = 1
+
+function frameOf(code, shift) { return 0x80 | (shift << 6) | (code & 63); }
+
 function encodeChar(ch) {
-    let shift = 0;
-    let c = ch;
-    if (/[A-Z]/.test(c)) { shift = 1; c = c.toLowerCase(); }
-    let val = 0;
-    if (/[a-z]/.test(c)) val = c.charCodeAt(0) - 96;
-    else if (/[0-9]/.test(c)) val = c.charCodeAt(0) - 48 + 27;
-    return 0x80 | (shift << 6) | (val & 63);
+    let i = TABLE0.indexOf(ch);
+    if (i >= 0) return frameOf(i, 0);
+    i = TABLE1.indexOf(ch);
+    if (i >= 0) return frameOf(i, 1);
+    return frameOf(0, 0); // حرف غير معروف -> مسافة
+}
+
+// يبقي فقط الحروف الموجودة في الجدولين
+function sanitize(str) {
+    return Array.from(str).filter(c => c !== PAD && (TABLE0.includes(c) || TABLE1.includes(c))).join('');
 }
 
 // ---------- Gemini ----------
@@ -49,13 +61,14 @@ async function askGemini() {
     try {
         const model = new GoogleGenerativeAI(API_KEY).getGenerativeModel({ model: MODEL });
         const result = await model.generateContent(
-            `Answer in short simple English (max 10 characters, letters/numbers only): ${question}`
+            `Answer in short simple English (max 10 characters, letters, numbers and simple symbols only): ${question}`
         );
-        const reply = result.response.text().trim().replace(/[^a-zA-Z0-9 ]/g, '').slice(0, 16);
-        session.lastResponse = reply;
-        session.queue = [RESET, ...reply.split('')];
-        log(`[Gemini] Q="${question}" A="${reply}"`);
-        return reply;
+        const reply = result.response.text().trim();
+        const clean = sanitize(reply).slice(0, 16);
+        session.lastResponse = clean;
+        session.queue = [RESET, ...clean.split('')];
+        log(`[Gemini] Q="${question}" A="${clean}"`);
+        return clean;
     } catch (err) {
         log('Gemini Error: ' + err.message);
         return 'ERR';
@@ -93,16 +106,25 @@ app.get('/api/display', (req, res) => {
         log('[RESET] مسح الشاشة');
         return res.json({ value: '01000000' }); // bit7=0 و bit6=1 => Reset
     }
-    const bits = toBits8(encodeChar(ch));
-    log(`[PRINT] '${ch}' -> ${bits} | باقي ${session.queue.length}`);
+    const isRaw = typeof ch === 'object';
+    const bits = toBits8(isRaw ? frameOf(ch.code, ch.shift) : encodeChar(ch));
+    log(`[PRINT] '${isRaw ? '#' + ch.code + ' shift=' + ch.shift : ch}' -> ${bits} | باقي ${session.queue.length}`);
     res.json({ value: bits });
 });
 
 // ---------- أدوات اختبار ----------
 // افتح: /api/say?text=Hello  لتجرب الشاشة بدون Gemini
 app.get('/api/say', (req, res) => {
-    session.queue = [RESET, ...String(req.query.text || '').replace(/[^a-zA-Z0-9 ]/g, '').split('')];
+    session.queue = [RESET, ...sanitize(String(req.query.text || '')).split('')];
     res.json({ queued: session.queue.length });
+});
+
+// افتح: /api/scan?shift=0  (ثم shift=1) لطباعة كل الأكواد 0..63 بالترتيب
+// بعدها اقرأ الشاشة: الخانة رقم i تعرض الحرف الذي رقمه i
+app.get('/api/scan', (req, res) => {
+    const shift = req.query.shift === '1' ? 1 : 0;
+    session.queue = [RESET, ...Array.from({ length: 64 }, (_, i) => ({ code: i, shift }))];
+    res.json({ queued: session.queue.length, shift });
 });
 
 app.get('/api/session', (req, res) => {
