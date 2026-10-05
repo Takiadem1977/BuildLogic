@@ -54,17 +54,37 @@ function sanitize(str) {
 }
 
 // ---------- Gemini ----------
+const MAX_REPLY = parseInt(process.env.MAX_REPLY || '32', 10);     // أقصى طول للرد
+const IDLE_SEND_MS = parseInt(process.env.IDLE_SEND_MS || '0', 10); // إرسال تلقائي بعد سكوت (0 = معطّل)
+let asking = false;
+let idleTimer = null;
+
+const SYSTEM_PROMPT = `You are the answer module of a tiny 16x16 character screen.
+The question was typed by hand with binary switches, so it may contain typos or missing letters: infer the most likely meaning.
+Answer the question directly and correctly, giving only the answer, no explanation.
+Reply in English using only letters, digits and spaces (no punctuation, no symbols, no emojis).
+Maximum ${MAX_REPLY} characters.
+Examples: "capital of france" -> "Paris" ; "2 plus 2" -> "4" ; "is the sun a star" -> "Yes".
+If the question is really unclear, reply "unclear".`;
+
 async function askGemini() {
+    clearTimeout(idleTimer);
+    if (asking) return 'BUSY';
     const question = session.buffer.trim();
     session.buffer = '';
     if (!question) return 'EMPTY';
+    asking = true;
+    log(`[ASK] "${question}" ... جاري التفكير`);
     try {
-        const model = new GoogleGenerativeAI(API_KEY).getGenerativeModel({ model: MODEL });
-        const result = await model.generateContent(
-            `Answer in short simple English (max 10 characters, letters, numbers and simple symbols only): ${question}`
-        );
-        const reply = result.response.text().trim();
-        const clean = sanitize(reply).slice(0, 16);
+        const model = new GoogleGenerativeAI(API_KEY).getGenerativeModel({
+            model: MODEL,
+            systemInstruction: SYSTEM_PROMPT,
+            generationConfig: { temperature: 0.3 }
+        });
+        const result = await model.generateContent(`Question: ${question}`);
+        const raw = result.response.text().replace(/\s+/g, ' ').trim();
+        let clean = sanitize(raw).trim().slice(0, MAX_REPLY);
+        if (!clean) clean = 'no answer';
         session.lastResponse = clean;
         session.queue = [RESET, ...clean.split('')];
         log(`[Gemini] Q="${question}" A="${clean}"`);
@@ -72,17 +92,32 @@ async function askGemini() {
     } catch (err) {
         log('Gemini Error: ' + err.message);
         return 'ERR';
+    } finally {
+        asking = false;
     }
 }
 
-// ---------- معالجة ضغطة مفتاح قادمة من الماب ----------
+// ---------- معالجة الضغطة القادمة من الماب ----------
+// كل ضغطة على زر Enter (POST) ترسل حرفاً واحداً بقيمة الـ 8 مفاتيح:
+//   00000000 (صفر)  -> إرسال السؤال إلى Gemini
+//   00001000 (8)    -> حذف آخر حرف
+//   غير ذلك (ASCII) -> يُضاف الحرف للسؤال
+function scheduleIdle() {
+    clearTimeout(idleTimer);
+    if (IDLE_SEND_MS > 0 && session.buffer.trim()) {
+        idleTimer = setTimeout(askGemini, IDLE_SEND_MS);
+    }
+}
+
 function handleKey(code) {
-    if (code === 13 || code === 10) {          // Enter -> أرسل لـ Gemini
+    if (code === 0 || code === 13 || code === 10) {
         askGemini();
-    } else if (code === 8) {                   // Backspace
+    } else if (code === 8 || code === 127) {
         session.buffer = session.buffer.slice(0, -1);
-    } else if (code >= 32 && code <= 126) {    // حرف عادي
+        scheduleIdle();
+    } else if (code >= 32 && code <= 126) {
         session.buffer += String.fromCharCode(code);
+        scheduleIdle();
     }
     log(`[KEY] code=${code} buffer="${session.buffer}"`);
 }
@@ -91,7 +126,7 @@ function handleKey(code) {
 // POST: الكيبورد يرسل الحرف (فقط يستقبل، لا يسحب من الطابور)
 app.post('/api/display', (req, res) => {
     const code = fromBits8(req.body?.value ?? req.query?.value);
-    if (code !== null && code !== 0) handleKey(code);
+    if (code !== null) handleKey(code);
     res.json({ value: '00000000' });
 });
 
