@@ -11,6 +11,7 @@ const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const LSB_FIRST = process.env.LSB_FIRST === '1';
 
 const session = { buffer: '', lastResponse: '', queue: [] };
+const RESET = '\u0001'; // علامة خاصة تتحول إلى إطار Reset (01000000)
 let lastLog = 'السيرفر جاهز.';
 const log = (m) => { lastLog = m; console.log(m); };
 
@@ -52,7 +53,7 @@ async function askGemini() {
         );
         const reply = result.response.text().trim().replace(/[^a-zA-Z0-9 ]/g, '').slice(0, 16);
         session.lastResponse = reply;
-        session.queue = reply.split('');
+        session.queue = [RESET, ...reply.split('')];
         log(`[Gemini] Q="${question}" A="${reply}"`);
         return reply;
     } catch (err) {
@@ -88,6 +89,10 @@ app.get('/api/display', (req, res) => {
     const ch = session.queue.shift();
     if (ch === undefined) return res.json({ value: '00000000' });
     gap = true;
+    if (ch === RESET) {
+        log('[RESET] مسح الشاشة');
+        return res.json({ value: '01000000' }); // bit7=0 و bit6=1 => Reset
+    }
     const bits = toBits8(encodeChar(ch));
     log(`[PRINT] '${ch}' -> ${bits} | باقي ${session.queue.length}`);
     res.json({ value: bits });
@@ -96,7 +101,7 @@ app.get('/api/display', (req, res) => {
 // ---------- أدوات اختبار ----------
 // افتح: /api/say?text=Hello  لتجرب الشاشة بدون Gemini
 app.get('/api/say', (req, res) => {
-    session.queue = String(req.query.text || '').replace(/[^a-zA-Z0-9 ]/g, '').split('');
+    session.queue = [RESET, ...String(req.query.text || '').replace(/[^a-zA-Z0-9 ]/g, '').split('')];
     res.json({ queued: session.queue.length });
 });
 
