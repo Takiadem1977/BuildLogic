@@ -10,6 +10,8 @@ const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const LSB_FIRST = process.env.LSB_FIRST === '1';                    // ترتيب البتات معكوس؟
 const MAX_REPLY = parseInt(process.env.MAX_REPLY || '32', 10);      // أقصى طول للرد
 const IDLE_SEND_MS = parseInt(process.env.IDLE_SEND_MS || '0', 10); // إرسال تلقائي بعد سكوت (0 = معطّل)
+// redraw (الافتراضي): مع كل حرف نمسح ونعيد كتابة السؤال كله بالترتيب | append: نضيف الحرف الجديد فقط
+const ECHO_MODE = process.env.ECHO_MODE || 'redraw';
 const SESSION_TTL_MS = 60 * 60 * 1000;                              // حذف الجلسة الخاملة بعد ساعة
 const MAX_SESSIONS = 200;
 const ASK_COOLDOWN_MS = 3000;                                       // أقل فاصل بين سؤالين لنفس الجلسة
@@ -175,8 +177,12 @@ function handleKey(s, code) {
         s.buffer += ch;
         const shown = sanitize(ch);
         if (shown) {
-            if (s.screen !== 'typing') s.queue = [RESET];
-            s.queue.push(shown);
+            if (ECHO_MODE === 'append' && s.screen === 'typing') {
+                s.queue.push(shown);
+            } else {
+                // نعيد رسم السؤال كاملاً من أول خانة: نفس مسار رد الـ AI الذي يعمل عندك
+                s.queue = [RESET, ...sanitize(s.buffer).split('')];
+            }
             s.screen = 'typing';
         }
         scheduleIdle(s);
