@@ -7,33 +7,85 @@ app.use(express.urlencoded({ extended: true }));
 
 const API_KEY = process.env.GEMINI_API_KEY;
 const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-// إذا تبيّن أن ترتيب البتات معكوس في الماب، ضع LSB_FIRST=1 في متغيرات البيئة
-const LSB_FIRST = process.env.LSB_FIRST === '1';
+const LSB_FIRST = process.env.LSB_FIRST === '1';                    // ترتيب البتات معكوس؟
+const MAX_REPLY = parseInt(process.env.MAX_REPLY || '32', 10);      // أقصى طول للرد
+const IDLE_SEND_MS = parseInt(process.env.IDLE_SEND_MS || '0', 10); // إرسال تلقائي بعد سكوت (0 = معطّل)
+const SESSION_TTL_MS = 60 * 60 * 1000;                              // حذف الجلسة الخاملة بعد ساعة
+const MAX_SESSIONS = 200;
+const ASK_COOLDOWN_MS = 3000;                                       // أقل فاصل بين سؤالين لنفس الجلسة
 
-const session = { buffer: '', lastResponse: '', queue: [] };
-const RESET = '\u0001'; // علامة خاصة تتحول إلى إطار Reset (01000000)
-let lastLog = 'السيرفر جاهز.';
-const log = (m) => { lastLog = m; console.log(m); };
+// =====================================================
+//  الجلسات: كل sid له buffer وطابور وشاشة مستقلة
+// =====================================================
+const sessions = new Map();
 
-// ---------- تحويل 8 بتات <-> رقم ----------
+function getSession(sid) {
+    let s = sessions.get(sid);
+    if (!s) {
+        if (sessions.size >= MAX_SESSIONS) return null;
+        s = {
+            sid,
+            buffer: '',          // السؤال الجاري كتابته
+            lastResponse: '',
+            queue: [],           // إطارات تنتظر الطباعة على الشاشة
+            screen: 'blank',     // 'blank' | 'typing' | 'reply'
+            gap: false,          // فراغ بين كل إطارين
+            asking: false,
+            lastAskAt: 0,
+            idleTimer: null,
+            lastLog: 'جلسة جديدة',
+            lastSeen: Date.now()
+        };
+        sessions.set(sid, s);
+    }
+    s.lastSeen = Date.now();
+    return s;
+}
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [sid, s] of sessions) {
+        if (now - s.lastSeen > SESSION_TTL_MS) {
+            clearTimeout(s.idleTimer);
+            sessions.delete(sid);
+        }
+    }
+}, 5 * 60 * 1000).unref();
+
+function log(s, m) { s.lastLog = m; console.log(`[${s.sid}] ${m}`); }
+
+// يحدد الجلسة من: /s/:sid/... أو ?sid= أو هيدر x-sid، وإلا 'default'
+function sessionFrom(req, res) {
+    const sid = String(req.params.sid || req.query.sid || req.get('x-sid') || 'default');
+    if (!/^[A-Za-z0-9_-]{1,32}$/.test(sid)) {
+        res.status(400).json({ error: 'sid غير صالح (حروف وأرقام و - _ فقط، حتى 32)' });
+        return null;
+    }
+    const s = getSession(sid);
+    if (!s) { res.status(503).json({ error: 'عدد الجلسات ممتلئ' }); return null; }
+    return s;
+}
+
+// =====================================================
+//  تحويل 8 بتات <-> رقم
+// =====================================================
 function toBits8(n) {
-    let s = (n & 255).toString(2).padStart(8, '0');
-    return LSB_FIRST ? s.split('').reverse().join('') : s;
+    const str = (n & 255).toString(2).padStart(8, '0');
+    return LSB_FIRST ? str.split('').reverse().join('') : str;
 }
 function fromBits8(str) {
-    let s = String(str ?? '').trim();
-    if (!/^[01]{8}$/.test(s)) return null;
-    if (LSB_FIRST) s = s.split('').reverse().join('');
-    return parseInt(s, 2);
+    let x = String(str ?? '').trim();
+    if (!/^[01]{8}$/.test(x)) return null;
+    if (LSB_FIRST) x = x.split('').reverse().join('');
+    return parseInt(x, 2);
 }
 
-// ---------- ترميز الحرف للشاشة ----------
-// الإطار (8 بتات):  bit7 = valid (يسمح بالـ Clock)
-//                    bit6 = SHIFT
-//                    bit5..0 = رقم الحرف (0..63)
-// الجدولان أدناه: رقم الحرف = موضعه في النص (الفهرس).
-// عدّلهما بعد ما تشغّل /api/scan وتشوف ترتيب الحروف الفعلي على الشاشة.
-// استعمل \u0002 لأي خانة لا تعرف ما هو الحرف فيها.
+// =====================================================
+//  ترميز الحرف للشاشة
+//  الإطار: bit7 = valid | bit6 = SHIFT | bit5..0 = رقم الحرف
+//  إطار Reset الخاص: 01000000
+// =====================================================
+const RESET = '\u0001';
 const PAD = '\u0002';
 const TABLE0 = (' abcdefghijklmnopqrstuvwxyz1234567890').padEnd(64, PAD); // SHIFT = 0
 const TABLE1 = (' ABCDEFGHIJKLMNOPQRSTUVWXYZ').padEnd(64, PAD);           // SHIFT = 1
@@ -45,20 +97,16 @@ function encodeChar(ch) {
     if (i >= 0) return frameOf(i, 0);
     i = TABLE1.indexOf(ch);
     if (i >= 0) return frameOf(i, 1);
-    return frameOf(0, 0); // حرف غير معروف -> مسافة
+    return frameOf(0, 0);
 }
 
-// يبقي فقط الحروف الموجودة في الجدولين
 function sanitize(str) {
-    return Array.from(str).filter(c => c !== PAD && (TABLE0.includes(c) || TABLE1.includes(c))).join('');
+    return Array.from(str).filter(c => c !== PAD && c !== RESET && (TABLE0.includes(c) || TABLE1.includes(c))).join('');
 }
 
-// ---------- Gemini ----------
-const MAX_REPLY = parseInt(process.env.MAX_REPLY || '32', 10);     // أقصى طول للرد
-const IDLE_SEND_MS = parseInt(process.env.IDLE_SEND_MS || '0', 10); // إرسال تلقائي بعد سكوت (0 = معطّل)
-let asking = false;
-let idleTimer = null;
-
+// =====================================================
+//  Gemini
+// =====================================================
 const SYSTEM_PROMPT = `You are the answer module of a tiny 16x16 character screen.
 The question was typed by hand with binary switches, so it may contain typos or missing letters: infer the most likely meaning.
 Answer the question directly and correctly, giving only the answer, no explanation.
@@ -67,14 +115,19 @@ Maximum ${MAX_REPLY} characters.
 Examples: "capital of france" -> "Paris" ; "2 plus 2" -> "4" ; "is the sun a star" -> "Yes".
 If the question is really unclear, reply "unclear".`;
 
-async function askGemini() {
-    clearTimeout(idleTimer);
-    if (asking) return 'BUSY';
-    const question = session.buffer.trim();
-    session.buffer = '';
+async function askGemini(s) {
+    clearTimeout(s.idleTimer);
+    if (s.asking) return 'BUSY';
+    const question = s.buffer.trim();
     if (!question) return 'EMPTY';
-    asking = true;
-    log(`[ASK] "${question}" ... جاري التفكير`);
+    if (Date.now() - s.lastAskAt < ASK_COOLDOWN_MS) {
+        log(s, '[ASK] انتظر قليلاً بين الأسئلة');
+        return 'WAIT';
+    }
+    s.buffer = '';
+    s.asking = true;
+    s.lastAskAt = Date.now();
+    log(s, `[ASK] "${question}" ... جاري التفكير`);
     try {
         const model = new GoogleGenerativeAI(API_KEY).getGenerativeModel({
             model: MODEL,
@@ -85,95 +138,107 @@ async function askGemini() {
         const raw = result.response.text().replace(/\s+/g, ' ').trim();
         let clean = sanitize(raw).trim().slice(0, MAX_REPLY);
         if (!clean) clean = 'no answer';
-        session.lastResponse = clean;
-        session.queue = [RESET, ...clean.split('')];
-        log(`[Gemini] Q="${question}" A="${clean}"`);
+        s.lastResponse = clean;
+        s.queue = [RESET, ...clean.split('')];
+        s.screen = 'reply';
+        log(s, `[Gemini] Q="${question}" A="${clean}"`);
         return clean;
     } catch (err) {
-        log('Gemini Error: ' + err.message);
+        log(s, 'Gemini Error: ' + err.message);
         return 'ERR';
     } finally {
-        asking = false;
+        s.asking = false;
     }
 }
 
-// ---------- معالجة الضغطة القادمة من الماب ----------
-// كل ضغطة على زر Enter (POST) ترسل حرفاً واحداً بقيمة الـ 8 مفاتيح:
-//   00000000 (صفر)  -> إرسال السؤال إلى Gemini
-//   00001000 (8)    -> حذف آخر حرف
-//   غير ذلك (ASCII) -> يُضاف الحرف للسؤال
-function scheduleIdle() {
-    clearTimeout(idleTimer);
-    if (IDLE_SEND_MS > 0 && session.buffer.trim()) {
-        idleTimer = setTimeout(askGemini, IDLE_SEND_MS);
+// =====================================================
+//  معالجة الضغطة القادمة من الماب (POST)
+//    00000000 -> إرسال السؤال | 00001000 -> حذف | غير ذلك: حرف ASCII
+// =====================================================
+function scheduleIdle(s) {
+    clearTimeout(s.idleTimer);
+    if (IDLE_SEND_MS > 0 && s.buffer.trim()) {
+        s.idleTimer = setTimeout(() => askGemini(s), IDLE_SEND_MS);
     }
 }
 
-function handleKey(code) {
+function handleKey(s, code) {
     if (code === 0 || code === 13 || code === 10) {
-        askGemini();
+        askGemini(s);
     } else if (code === 8 || code === 127) {
-        session.buffer = session.buffer.slice(0, -1);
-        scheduleIdle();
+        s.buffer = s.buffer.slice(0, -1);
+        s.queue = [RESET, ...sanitize(s.buffer).split('')];
+        s.screen = 'typing';
+        scheduleIdle(s);
     } else if (code >= 32 && code <= 126) {
-        session.buffer += String.fromCharCode(code);
-        scheduleIdle();
+        const ch = String.fromCharCode(code);
+        s.buffer += ch;
+        const shown = sanitize(ch);
+        if (shown) {
+            if (s.screen !== 'typing') s.queue = [RESET];
+            s.queue.push(shown);
+            s.screen = 'typing';
+        }
+        scheduleIdle(s);
     }
-    log(`[KEY] code=${code} buffer="${session.buffer}"`);
+    log(s, `[KEY] code=${code} buffer="${s.buffer}"`);
 }
 
-// ---------- مسارات الماب ----------
-// POST: الكيبورد يرسل الحرف (فقط يستقبل، لا يسحب من الطابور)
-app.post('/api/display', (req, res) => {
+// =====================================================
+//  مسارات الماب
+//  الرابط في قطعة HTTP:  https://موقعك/s/اسم-الجلسة/display
+// =====================================================
+app.post(['/api/display', '/s/:sid/display'], (req, res) => {
+    const s = sessionFrom(req, res);
+    if (!s) return;
     const code = fromBits8(req.body?.value ?? req.query?.value);
-    if (code !== null) handleKey(code);
+    if (code !== null) handleKey(s, code);
     res.json({ value: '00000000' });
 });
 
-// GET: القطعة تسأل كل 0.1 ثانية، نعطيها حرفاً واحداً في كل مرة
-let gap = false; // فراغ بين كل حرفين حتى ينزل البت 7 ويطلع من جديد
-app.get('/api/display', (req, res) => {
-    if (gap) { gap = false; return res.json({ value: '00000000' }); }
-    const ch = session.queue.shift();
+app.get(['/api/display', '/s/:sid/display'], (req, res) => {
+    const s = sessionFrom(req, res);
+    if (!s) return;
+    if (s.gap) { s.gap = false; return res.json({ value: '00000000' }); }
+    const ch = s.queue.shift();
     if (ch === undefined) return res.json({ value: '00000000' });
-    gap = true;
+    s.gap = true;
     if (ch === RESET) {
-        log('[RESET] مسح الشاشة');
-        return res.json({ value: '01000000' }); // bit7=0 و bit6=1 => Reset
+        log(s, '[RESET] مسح الشاشة');
+        return res.json({ value: '01000000' });
     }
     const isRaw = typeof ch === 'object';
     const bits = toBits8(isRaw ? frameOf(ch.code, ch.shift) : encodeChar(ch));
-    log(`[PRINT] '${isRaw ? '#' + ch.code + ' shift=' + ch.shift : ch}' -> ${bits} | باقي ${session.queue.length}`);
+    log(s, `[PRINT] '${isRaw ? '#' + ch.code + ' shift=' + ch.shift : ch}' -> ${bits} | باقي ${s.queue.length}`);
     res.json({ value: bits });
 });
 
-// ---------- أدوات اختبار ----------
-// افتح: /api/say?text=Hello  لتجرب الشاشة بدون Gemini
+// ---------- أدوات اختبار (أضف ?sid=اسمك) ----------
 app.get('/api/say', (req, res) => {
-    session.queue = [RESET, ...sanitize(String(req.query.text || '')).split('')];
-    res.json({ queued: session.queue.length });
+    const s = sessionFrom(req, res); if (!s) return;
+    s.queue = [RESET, ...sanitize(String(req.query.text || '')).split('')];
+    s.screen = 'reply';
+    res.json({ sid: s.sid, queued: s.queue.length });
 });
 
-// افتح: /api/scan?shift=0  (ثم shift=1) لطباعة كل الأكواد 0..63 بالترتيب
-// بعدها اقرأ الشاشة: الخانة رقم i تعرض الحرف الذي رقمه i
 app.get('/api/scan', (req, res) => {
+    const s = sessionFrom(req, res); if (!s) return;
     const shift = req.query.shift === '1' ? 1 : 0;
-    session.queue = [RESET, ...Array.from({ length: 64 }, (_, i) => ({ code: i, shift }))];
-    res.json({ queued: session.queue.length, shift });
-});
-
-app.get('/api/session', (req, res) => {
-    res.json({
-        buffer: session.buffer,
-        lastResponse: session.lastResponse,
-        remaining: session.queue.length,
-        lastLog
-    });
+    s.queue = [RESET, ...Array.from({ length: 64 }, (_, i) => ({ code: i, shift }))];
+    res.json({ sid: s.sid, queued: s.queue.length, shift });
 });
 
 app.get('/api/ask', async (req, res) => {
-    const reply = await askGemini();
-    res.json({ response: reply });
+    const s = sessionFrom(req, res); if (!s) return;
+    res.json({ sid: s.sid, response: await askGemini(s) });
+});
+
+app.get('/api/session', (req, res) => {
+    const s = sessionFrom(req, res); if (!s) return;
+    res.json({
+        sid: s.sid, buffer: s.buffer, lastResponse: s.lastResponse,
+        remaining: s.queue.length, lastLog: s.lastLog, activeSessions: sessions.size
+    });
 });
 
 app.get('/', (req, res) => {
@@ -182,12 +247,15 @@ app.get('/', (req, res) => {
 <style>body{font-family:system-ui;background:#0f172a;color:#f8fafc;text-align:center;padding:30px}
 .b{background:#020617;padding:12px;margin:8px auto;max-width:520px;border-radius:8px;font-family:monospace;color:#38bdf8;word-break:break-all}</style>
 </head><body><h2>Build Logic Terminal</h2>
+<p>الجلسة: <b id="sid">-</b> &nbsp;|&nbsp; الجلسات النشطة: <b id="act">-</b></p>
 <p>Buffer</p><div class="b" id="buf">-</div>
 <p>رد Gemini</p><div class="b" id="ans" style="color:#4ade80">-</div>
 <p>المتبقي: <b id="rem">0</b></p><div class="b" id="log" style="color:#facc15;font-size:13px">-</div>
 <script>
-setInterval(async()=>{try{const d=await (await fetch('/api/session')).json();
-buf.innerText=d.buffer||'(فارغ)';ans.innerText=d.lastResponse||'-';rem.innerText=d.remaining;log.innerText=d.lastLog}catch(e){}},1000);
+const sidQ = new URLSearchParams(location.search).get('sid') || 'default';
+setInterval(async()=>{try{const d=await (await fetch('/api/session?sid='+encodeURIComponent(sidQ))).json();
+sid.innerText=d.sid;act.innerText=d.activeSessions;buf.innerText=d.buffer||'(فارغ)';
+ans.innerText=d.lastResponse||'-';rem.innerText=d.remaining;log.innerText=d.lastLog}catch(e){}},1000);
 </script></body></html>`);
 });
 
