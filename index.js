@@ -23,9 +23,52 @@ const ASK_COOLDOWN_MS = 3000;                                       // أقل ف
 // =====================================================
 const sessions = new Map();
 
+function getSession(sid) {
+    let s = sessions.get(sid);
+    if (!s) {
+        if (sessions.size >= MAX_SESSIONS) return null;
+        s = {
+            sid,
+            buffer: '',          // السؤال الجاري كتابته
+            lastResponse: '',
+            queue: [],           // إطارات تنتظر الطباعة على الشاشة
+            screen: 'blank',     // 'blank' | 'typing' | 'reply'
+            gap: false,          // فراغ بين كل إطارين
+            asking: false,
+            lastAskAt: 0,
+            idleTimer: null,
+            lastLog: 'جلسة جديدة',
+            lastSeen: Date.now()
+        };
+        sessions.set(sid, s);
+    }
+    s.lastSeen = Date.now();
+    return s;
+}
 
+setInterval(() => {
+    const now = Date.now();
+    for (const [sid, s] of sessions) {
+        if (now - s.lastSeen > SESSION_TTL_MS) {
+            clearTimeout(s.idleTimer);
+            sessions.delete(sid);
+        }
+    }
+}, 5 * 60 * 1000).unref();
 
+function log(s, m) { s.lastLog = m; console.log(`[${s.sid}] ${m}`); }
 
+// يحدد الجلسة من: /s/:sid/... أو ?sid= أو هيدر x-sid، وإلا 'default'
+function sessionFrom(req, res) {
+    const sid = String(req.params.sid || req.query.sid || req.get('x-sid') || 'default');
+    if (!/^[A-Za-z0-9_-]{1,32}$/.test(sid)) {
+        res.status(400).json({ error: 'sid غير صالح (حروف وأرقام و - _ فقط، حتى 32)' });
+        return null;
+    }
+    const s = getSession(sid);
+    if (!s) { res.status(503).json({ error: 'عدد الجلسات ممتلئ' }); return null; }
+    return s;
+}
 
 // =====================================================
 //  تحويل 8 بتات <-> رقم
@@ -150,11 +193,62 @@ function handleKey(s, code) {
     log(s, `[KEY] code=${code} buffer="${s.buffer}"`);
 }
 
+// =====================================================
+//  مسارات الماب
+//  الرابط في قطعة HTTP:  https://موقعك/s/اسم-الجلسة/display
+// =====================================================
+app.post(['/api/display', '/s/:sid/display'], (req, res) => {
+    const s = sessionFrom(req, res);
+    if (!s) return;
+    const code = fromBits8(req.body?.value ?? req.query?.value);
+    if (code !== null) handleKey(s, code);
+    res.json({ value: '00000000' });
+});
 
+app.get(['/api/display', '/s/:sid/display'], (req, res) => {
+    const s = sessionFrom(req, res);
+    if (!s) return;
+    if (s.gap) { s.gap = false; return res.json({ value: '00000000' }); }
+    const ch = s.queue.shift();
+    if (ch === undefined) return res.json({ value: '00000000' });
+    s.gap = true;
+    if (ch === RESET) {
+        log(s, '[RESET] مسح الشاشة');
+        return res.json({ value: '01000000' });
+    }
+    const isRaw = typeof ch === 'object';
+    const bits = toBits8(isRaw ? frameOf(ch.code, ch.shift) : encodeChar(ch));
+    log(s, `[PRINT] '${isRaw ? '#' + ch.code + ' shift=' + ch.shift : ch}' -> ${bits} | باقي ${s.queue.length}`);
+    res.json({ value: bits });
+});
 
+// ---------- أدوات اختبار (أضف ?sid=اسمك) ----------
+app.get('/api/say', (req, res) => {
+    const s = sessionFrom(req, res); if (!s) return;
+    s.queue = [RESET, ...sanitize(String(req.query.text || '')).split('')];
+    s.screen = 'reply';
+    res.json({ sid: s.sid, queued: s.queue.length });
+});
 
+app.get('/api/scan', (req, res) => {
+    const s = sessionFrom(req, res); if (!s) return;
+    const shift = req.query.shift === '1' ? 1 : 0;
+    s.queue = [RESET, ...Array.from({ length: 64 }, (_, i) => ({ code: i, shift }))];
+    res.json({ sid: s.sid, queued: s.queue.length, shift });
+});
 
+app.get('/api/ask', async (req, res) => {
+    const s = sessionFrom(req, res); if (!s) return;
+    res.json({ sid: s.sid, response: await askGemini(s) });
+});
 
+app.get('/api/session', (req, res) => {
+    const s = sessionFrom(req, res); if (!s) return;
+    res.json({
+        sid: s.sid, buffer: s.buffer, lastResponse: s.lastResponse,
+        remaining: s.queue.length, lastLog: s.lastLog, activeSessions: sessions.size
+    });
+});
 
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html><html lang="ar"><head><meta charset="UTF-8">
